@@ -7,7 +7,6 @@ anydef OpenClaw 加密工具包 0.1 (Encryption Toolkit)
 安全性 — 采用 AES-256-GCM + PBKDF2 密钥派生，支持密钥轮换
 可审计 — 完整的加密操作日志，不记录明文内容
 
-
 加密范围（数据分类）
 数据类型存储位置默认策略说明上传文件内容storage/files/
 可选加密文件原始内容对话 Memorystorage/memory/
