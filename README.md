@@ -246,7 +246,7 @@ anydef-encryption 技能包是一个为 OpenClaw 平台设计的 Agent 数据透
 
 三层密钥结构：层层包装、泄露隔离、轮换高效
 
-<img width="896" height="794" alt="7e2c9d1f-f84c-4725-9c26-5e1a00ac9c21" src="https://github.com/user-attachments/assets/1ab206a9-d4f9-41b3-a21b-cc4c323a765e" />
+<img width="400" height="380" alt="7e2c9d1f-f84c-4725-9c26-5e1a00ac9c21" src="https://github.com/user-attachments/assets/1ab206a9-d4f9-41b3-a21b-cc4c323a765e" />
 
 
 
