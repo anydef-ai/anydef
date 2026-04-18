@@ -1,17 +1,18 @@
 {
-  "name": "anydef-enc",
-  "description": "Local-Only Agent Data Encryption Toolkit with MK->KEK->DEK hierarchy.",
-  "version": "2.1.0",
+  "name": "backendenc",
+  "description": "Backend Agent Data Encryption Toolkit implementing MK->KEK->DEK hierarchy.",
+  "version": "2.2.0",
   "author": "AnyDef Security Team",
+  "environment": "node",
   "requiredCredentials": [],
   "capabilities": [
     "encryption",
     "key-management",
-    "zero-network",
+    "backend-security",
     "selective-encryption"
   ],
   "permissions": [
-    "window.crypto.subtle",
-    "window.storage"
+    "node:crypto",
+    "node:fs"
   ]
 }

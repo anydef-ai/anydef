@@ -1,179 +1,202 @@
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+
 /**
- * Encryption Service (Manual Local Mode)
+ * Encryption Service (Node.js/Backend Edition - Multi-User + Channel Isolated)
  * 
- * Implements MK -> KEK -> DEK hierarchy using PBKDF2 for Master Key derivation.
- * Supports reboot persistence by ensuring the same passphrase always yields the same MK.
+ * 修正版：移除 TS 类型注解，确保在原生 Node.js 环境下通过
  */
-
 export class EncryptionService {
-  private static masterKey: CryptoKey | null = null;
-  private static kek: CryptoKey | null = null;
-  private static deks: Map<string, CryptoKey> = new Map();
+  // 静态属性（使用标准 JS 语法）
+  static masterKeys = new Map();
+  static keks = new Map();
+  static deks = new Map();
+  
+  static storagePath = path.join(process.cwd(), '.anydef-vault.json');
+  static vaultBaseDir = path.join(process.cwd(), '.anydef-vault');
 
-  /**
-   * Unlocks the vault using a user-provided passphrase.
-   * Derives a deterministic Master Key (MK) using PBKDF2 + a persistent Salt.
-   */
-  static async unlock(passphrase: string) {
-    const encoder = new TextEncoder();
-    
-    // 1. Get or Initialize a persistent salt to ensure deterministic MK across reboots
-    let saltBase64 = await window.storage.get("enc-vault-salt");
-    let salt: Uint8Array;
-    if (!saltBase64) {
-      salt = window.crypto.getRandomValues(new Uint8Array(16));
-      await window.storage.set("enc-vault-salt", this.bufferToBase64(salt));
-    } else {
-      salt = this.base64ToBuffer(saltBase64);
+  static getCtx(userId, channelId) {
+    return `${userId}:${channelId}`;
+  }
+
+  static async storageGet(key) {
+    try {
+      if (!fs.existsSync(this.storagePath)) return null;
+      const data = JSON.parse(fs.readFileSync(this.storagePath, 'utf8'));
+      return data[key] || null;
+    } catch (e) {
+      console.error("[Vault] Storage Read Error:", e);
+      return null;
     }
-    
-    // 2. Import raw passphrase as a base key
-    const baseKey = await window.crypto.subtle.importKey(
-      "raw",
-      encoder.encode(passphrase),
-      "PBKDF2",
-      false,
-      ["deriveKey"]
-    );
-    
-    // 3. Derive high-entropy Master Key (MK)
-    this.masterKey = await window.crypto.subtle.deriveKey(
-      { 
-        name: "PBKDF2", 
-        salt: salt, 
-        iterations: 100000, 
-        hash: "SHA-256" 
-      },
-      baseKey,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["encrypt", "decrypt"]
-    );
+  }
 
-    console.log("Vault Master Key established.");
-    await this.initKek();
+  static async storageSet(key, value) {
+    try {
+      const data = fs.existsSync(this.storagePath) 
+        ? JSON.parse(fs.readFileSync(this.storagePath, 'utf8')) 
+        : {};
+      data[key] = value;
+      fs.writeFileSync(this.storagePath, JSON.stringify(data, null, 2));
+    } catch (e) {
+      console.error("[Vault] Storage Write Error:", e);
+    }
   }
 
   /**
-   * Initializes or retrieves the KEK (wrapped by MK).
+   * 解锁特定上下文
    */
-  private static async initKek() {
-    if (!this.masterKey) throw new Error("Vault locked: Master Key missing.");
+  static async unlock(userId, channelId, passphrase) {
+    const ctx = this.getCtx(userId, channelId);
     
-    const wrappedKek = await window.storage.get("enc-kek-wrapped");
+    const saltKey = `${ctx}:enc-vault-salt`;
+    let saltBase64 = await this.storageGet(saltKey);
+    let salt;
+    if (!saltBase64) {
+      salt = crypto.randomBytes(16);
+      await this.storageSet(saltKey, salt.toString('base64'));
+    } else {
+      salt = Buffer.from(saltBase64, 'base64');
+    }
+
+    this.masterKeys.set(ctx, crypto.pbkdf2Sync(passphrase, salt, 100000, 32, 'sha256'));
+    await this.initKek(userId, channelId);
+    console.log(`[Vault] Context ${ctx} unlocked successfully.`);
+  }
+
+  static async initKek(userId, channelId) {
+    const ctx = this.getCtx(userId, channelId);
+    const mk = this.masterKeys.get(ctx);
+    if (!mk) throw new Error("Context not unlocked");
+    
+    const storageKey = `${ctx}:enc-kek-wrapped`;
+    const wrappedKek = await this.storageGet(storageKey);
     
     if (wrappedKek) {
-      // Recovery: Unwrap existing KEK with the newly derived MK
-      this.kek = await this.unwrapKey(wrappedKek, this.masterKey, "KEK");
+      this.keks.set(ctx, await this.decryptRaw(wrappedKek, mk));
     } else {
-      // First run: Generate KEK and wrap it with MK
-      this.kek = await window.crypto.subtle.generateKey(
-        { name: "AES-GCM", length: 256 },
-        true,
-        ["encrypt", "decrypt", "wrapKey", "unwrapKey"]
-      );
-      const wrapped = await this.wrapKey(this.kek, this.masterKey);
-      await window.storage.set("enc-kek-wrapped", wrapped);
+      const kek = crypto.randomBytes(32);
+      const wrapped = await this.encryptRaw(kek, mk);
+      await this.storageSet(storageKey, wrapped);
+      this.keks.set(ctx, kek);
     }
   }
 
   /**
-   * Encrypts data for a specific scope (memory, history, assets, etc.).
+   * 保存数据（带隔离）
    */
-  static async encrypt(scope: string, data: string): Promise<string> {
-    const dek = await this.getOrCreateDek(scope);
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-    const encoded = new TextEncoder().encode(data);
-    
-    const ciphertext = await window.crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
-      dek,
-      encoded
-    );
-
-    return `${this.bufferToBase64(iv)}:${this.bufferToBase64(new Uint8Array(ciphertext))}`;
+  static async save(userId, channelId, scope, key, data) {
+    try {
+      const encrypted = await this.encrypt(userId, channelId, scope, data);
+      const ctx = this.getCtx(userId, channelId);
+      
+      if (scope === 'assets') {
+        const userDir = path.join(this.vaultBaseDir, userId, channelId);
+        if (!fs.existsSync(userDir)) {
+          fs.mkdirSync(userDir, { recursive: true });
+        }
+        const filePath = path.join(userDir, `${key}.enc`);
+        fs.writeFileSync(filePath, encrypted);
+        console.log(`[Vault] Asset saved to: ${filePath}`);
+        return filePath;
+      } else {
+        const storageKey = `vault:${ctx}:${scope}:${key}`;
+        await this.storageSet(storageKey, encrypted);
+        return storageKey;
+      }
+    } catch (e) {
+      console.error("[Vault] Save Error:", e);
+      throw e;
+    }
   }
 
-  /**
-   * Decrypts scoped data.
-   */
-  static async decrypt(scope: string, encryptedData: string): Promise<string> {
-    const dek = await this.getOrCreateDek(scope);
-    const [ivBase64, cipherBase64] = encryptedData.split(':');
-    const iv = this.base64ToBuffer(ivBase64);
-    const ciphertext = this.base64ToBuffer(cipherBase64);
-    
-    const decrypted = await window.crypto.subtle.decrypt(
-      { name: "AES-GCM", iv },
-      dek,
-      ciphertext
-    );
+  static async load(userId, channelId, scope, key) {
+    const ctx = this.getCtx(userId, channelId);
+    let encrypted = null;
 
-    return new TextDecoder().decode(decrypted);
+    if (scope === 'assets') {
+      const filePath = path.join(this.vaultBaseDir, userId, channelId, `${key}.enc`);
+      if (fs.existsSync(filePath)) {
+        encrypted = fs.readFileSync(filePath, 'utf8');
+      }
+    } else {
+      encrypted = await this.storageGet(`vault:${ctx}:${scope}:${key}`);
+    }
+
+    if (!encrypted) return null;
+    return await this.decrypt(userId, channelId, scope, encrypted);
   }
 
-  private static async getOrCreateDek(scope: string): Promise<CryptoKey> {
-    if (!this.kek) throw new Error("KEK not initialized. Did you unlock the vault?");
-    if (this.deks.has(scope)) return this.deks.get(scope)!;
-
-    const storageKey = `enc-dek-${scope}`;
-    const wrappedDek = await window.storage.get(storageKey);
+  static async encrypt(userId, channelId, scope, data) {
+    const dek = await this.getOrCreateDek(userId, channelId, scope);
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', dek, iv);
     
-    let dek: CryptoKey;
+    let encrypted = cipher.update(data, 'utf8', 'base64');
+    encrypted += cipher.final('base64');
+    const authTag = cipher.getAuthTag().toString('base64');
+
+    return `${iv.toString('base64')}:${encrypted}:${authTag}`;
+  }
+
+  static async decrypt(userId, channelId, scope, encryptedData) {
+    const dek = await this.getOrCreateDek(userId, channelId, scope);
+    const [ivBase64, cipherBase64, authTagBase64] = encryptedData.split(':');
+    
+    const iv = Buffer.from(ivBase64, 'base64');
+    const authTag = Buffer.from(authTagBase64, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', dek, iv);
+    
+    decipher.setAuthTag(authTag);
+    let decrypted = decipher.update(cipherBase64, 'base64', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  }
+
+  static async getOrCreateDek(userId, channelId, scope) {
+    const ctx = this.getCtx(userId, channelId);
+    const kek = this.keks.get(ctx);
+    if (!kek) throw new Error(`Vault locked for context ${ctx}`);
+
+    if (!this.deks.has(ctx)) this.deks.set(ctx, new Map());
+    const ctxDeks = this.deks.get(ctx);
+
+    if (ctxDeks.has(scope)) return ctxDeks.get(scope);
+
+    const storageKey = `${ctx}:enc-dek-${scope}`;
+    const wrappedDek = await this.storageGet(storageKey);
+    
+    let dek;
     if (wrappedDek) {
-      dek = await this.unwrapKey(wrappedDek, this.kek, `DEK_${scope}`);
+      dek = await this.decryptRaw(wrappedDek, kek);
     } else {
-      dek = await window.crypto.subtle.generateKey(
-        { name: "AES-GCM", length: 256 },
-        true,
-        ["encrypt", "decrypt"]
-      );
-      const wrapped = await this.wrapKey(dek, this.kek);
-      await window.storage.set(storageKey, wrapped);
+      dek = crypto.randomBytes(32);
+      const wrapped = await this.encryptRaw(dek, kek);
+      await this.storageSet(storageKey, wrapped);
     }
     
-    this.deks.set(scope, dek);
+    ctxDeks.set(scope, dek);
     return dek;
   }
 
-  // --- Helper Methods ---
-
-  private static async wrapKey(keyToWrap: CryptoKey, wrappingKey: CryptoKey): Promise<string> {
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-    const rawExport = await window.crypto.subtle.exportKey("raw", keyToWrap);
-    const wrapped = await window.crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
-      wrappingKey,
-      rawExport
-    );
-    return `${this.bufferToBase64(iv)}:${this.bufferToBase64(new Uint8Array(wrapped))}`;
+  static async encryptRaw(data, key) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    let encrypted = cipher.update(data);
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
+    return `${iv.toString('base64')}:${encrypted.toString('base64')}:${cipher.getAuthTag().toString('base64')}`;
   }
 
-  private static async unwrapKey(wrappedStr: string, wrappingKey: CryptoKey, purpose: string): Promise<CryptoKey> {
-    const [ivBase64, cipherBase64] = wrappedStr.split(':');
-    const iv = this.base64ToBuffer(ivBase64);
-    const ciphertext = this.base64ToBuffer(cipherBase64);
-
-    const rawKey = await window.crypto.subtle.decrypt(
-      { name: "AES-GCM", iv },
-      wrappingKey,
-      ciphertext
-    );
-
-    return window.crypto.subtle.importKey(
-      "raw",
-      rawKey,
-      { name: "AES-GCM" },
-      true,
-      purpose.startsWith("KEK") ? ["encrypt", "decrypt", "wrapKey", "unwrapKey"] : ["encrypt", "decrypt"]
-    );
-  }
-
-  private static bufferToBase64(buf: Uint8Array): string {
-    return btoa(String.fromCharCode(...buf));
-  }
-
-  private static base64ToBuffer(base64: string): Uint8Array {
-    return new Uint8Array(atob(base64).split("").map(c => c.charCodeAt(0)));
+  static async decryptRaw(wrappedStr, key) {
+    const [ivBase64, cipherBase64, authTagBase64] = wrappedStr.split(':');
+    const iv = Buffer.from(ivBase64, 'base64');
+    const authTag = Buffer.from(authTagBase64, 'base64');
+    const cipher = Buffer.from(cipherBase64, 'base64');
+    
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(authTag);
+    let decrypted = decipher.update(cipher);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+    return decrypted;
   }
 }

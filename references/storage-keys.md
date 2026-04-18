@@ -1,14 +1,12 @@
-# Storage Keys Dictionary
+# Backend Storage Schema
 
-The skill uses the following keys in `window.storage`:
+In the Node.js version, the service expects a storage mechanism to handle the following keys. By default, it uses `.anydef-vault.json` in the current working directory.
 
-| Key | Description | Scope |
-|-----|-------------|-------|
-| `enc-dek` | Encrypted Data Encryption Keys | Persistent |
-| `enc-cfg` | Encryption Hierarchy Configuration | Persistent |
-| `enc-kp-cfg` | Key Provider Configuration (Encrypted) | Persistent/Session |
-| `audit` | Encrypted Audit Logs | Persistent |
-| `data` | Encrypted Application Data | Persistent |
+| Key | Description | Type |
+|-----|-------------|------|
+| `enc-vault-salt` | Base64 encoded salt for PBKDF2 derivation. | String |
+| `enc-kek-wrapped` | The KEK wrapped by the Master Key (IV:Cipher:Tag). | String |
+| `enc-dek-{scope}` | The DEK for a specific scope wrapped by KEK. | String |
 
-## Security Note
-Sensitive configuration within `enc-kp-cfg` (like API keys) is encrypted with the Local Master Key before storage.
+## Security Policy
+The storage file itself contains only encrypted blobs and public salts. Without the user-provided passphrase, the data is cryptographically useless.
